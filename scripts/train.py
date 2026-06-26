@@ -1,8 +1,9 @@
 """
-train.py -- Basic FocusGuard CNN training
+train.py -- FocusGuard CNN with MLflow tracking
 
 Usage:
     python scripts\train.py --lr 1e-3 --epochs 30 --batch_size 32
+    python scripts\train.py --lr 5e-4 --epochs 50 --batch_size 64 --augment
 """
 
 import argparse, os, json, time
@@ -14,6 +15,8 @@ from torchvision import datasets, transforms
 from sklearn.metrics import f1_score, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
+import mlflow
+import mlflow.pytorch
 
 
 # --- 1. Model ----------------------------------------------------------------
@@ -22,10 +25,10 @@ class FocusCNN(nn.Module):
     def __init__(self, dropout: float = 0.5):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
@@ -119,65 +122,107 @@ def train(args):
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    best_val_acc = 0.0
-    best_model_path = os.path.join("models", "best_model.pt")
-    os.makedirs("models", exist_ok=True)
-    history = []
+    # Setup MLflow
+    mlflow.set_tracking_uri("http://localhost:5000")
+    mlflow.set_experiment("focus_classifier")
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        train_loss, train_correct = 0.0, 0
-        t0 = time.time()
+    with mlflow.start_run(run_name=args.run_name) as run:
+        print(f"\nMLflow run ID : {run.info.run_id}")
+        print(f"Open UI at    : http://localhost:5000")
 
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            out = model(images)
-            loss = criterion(out, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * images.size(0)
-            train_correct += (out.argmax(1) == labels).sum().item()
-
-        scheduler.step()
-        train_loss /= len(train_loader.dataset)
-        train_acc = train_correct / len(train_loader.dataset)
-
-        val_loss, val_acc, val_f1, preds, true_labels = evaluate(
-            model, val_loader, criterion, device
-        )
-        elapsed = time.time() - t0
-
-        history.append({
-            "epoch": epoch,
-            "train_loss": round(train_loss, 4), "train_acc": round(train_acc, 4),
-            "val_loss": round(val_loss, 4), "val_acc": round(val_acc, 4),
-            "val_f1": round(val_f1, 4),
+        # Log parameters
+        mlflow.log_params({
+            "lr": args.lr,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "dropout": args.dropout,
+            "weight_decay": args.weight_decay,
+            "augment": args.augment,
+            "optimizer": "adam",
+            "scheduler": "cosine_annealing",
+            "architecture": "FocusCNN_v1",
+            "image_size": 96,
         })
 
-        print(f"Epoch {epoch:03d}/{args.epochs}  "
-              f"train={train_loss:.4f}/{train_acc:.4f}  "
-              f"val={val_loss:.4f}/{val_acc:.4f}  f1={val_f1:.4f}  {elapsed:.1f}s")
+        best_val_acc = 0.0
+        best_model_path = os.path.join("models", "best_model.pt")
+        os.makedirs("models", exist_ok=True)
+        history = []
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  ^ New best val_acc={val_acc:.4f}")
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            train_loss, train_correct = 0.0, 0
+            t0 = time.time()
 
-    # Save final artifacts
-    cm_path = os.path.join("models", "confusion_matrix.png")
-    save_confusion_matrix(preds, true_labels, classes, cm_path)
+            for images, labels in train_loader:
+                images, labels = images.to(device), labels.to(device)
+                optimizer.zero_grad()
+                out = model(images)
+                loss = criterion(out, labels)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * images.size(0)
+                train_correct += (out.argmax(1) == labels).sum().item()
 
-    history_path = os.path.join("models", "history.json")
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
+            scheduler.step()
+            train_loss /= len(train_loader.dataset)
+            train_acc = train_correct / len(train_loader.dataset)
 
-    report_path = os.path.join("models", "classification_report.txt")
-    with open(report_path, "w") as f:
-        f.write(classification_report(true_labels, preds, target_names=classes))
+            val_loss, val_acc, val_f1, preds, true_labels = evaluate(
+                model, val_loader, criterion, device
+            )
+            elapsed = time.time() - t0
 
-    print(f"\nDone. Best val_acc={best_val_acc:.4f}")
-    return best_val_acc
+            # Log metrics per epoch
+            mlflow.log_metrics({
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_f1": val_f1,
+                "lr": scheduler.get_last_lr()[0],
+                "epoch_time": elapsed,
+            }, step=epoch)
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": round(train_loss, 4), "train_acc": round(train_acc, 4),
+                "val_loss": round(val_loss, 4), "val_acc": round(val_acc, 4),
+                "val_f1": round(val_f1, 4),
+            })
+
+            print(f"Epoch {epoch:03d}/{args.epochs}  "
+                  f"train={train_loss:.4f}/{train_acc:.4f}  "
+                  f"val={val_loss:.4f}/{val_acc:.4f}  f1={val_f1:.4f}  {elapsed:.1f}s")
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), best_model_path)
+                print(f"  ^ New best val_acc={val_acc:.4f}")
+
+        # Log artifacts
+        cm_path = os.path.join("models", "confusion_matrix.png")
+        save_confusion_matrix(preds, true_labels, classes, cm_path)
+        mlflow.log_artifact(cm_path)
+
+        history_path = os.path.join("models", "history.json")
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+        mlflow.log_artifact(history_path)
+
+        report_path = os.path.join("models", "classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write(classification_report(true_labels, preds, target_names=classes))
+        mlflow.log_artifact(report_path)
+
+        # Log model
+        model.load_state_dict(torch.load(best_model_path))
+        mlflow.pytorch.log_model(model, "model")
+
+        mlflow.log_metrics({"best_val_acc": best_val_acc, "final_val_f1": val_f1})
+
+        print(f"\nDone. best_val_acc={best_val_acc:.4f}  run_id={run.info.run_id}")
+    return run.info.run_id
 
 
 # --- 5. Args -----------------------------------------------------------------
@@ -185,6 +230,7 @@ def train(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default=r"data\processed")
+    ap.add_argument("--run_name", default=None)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
