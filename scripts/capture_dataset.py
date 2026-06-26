@@ -3,6 +3,9 @@ import cv2, os, time, argparse
 def record(label: str, duration: int = 120, out_dir: str = r"data\raw"):
     os.makedirs(out_dir, exist_ok=True)
 
+   ##This works with the default webcam on Windows. If you have multiple cameras, you may need to change the index from 0 to 1 or 2.
+   #Todo: Add Industrial cameras, IP cameras support later ;)
+   
    
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 
