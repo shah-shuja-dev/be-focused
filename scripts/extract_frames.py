@@ -1,10 +1,16 @@
 import cv2, os, argparse, sys, logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import mediapipe as mp
+import numpy as np
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ExtractionConfig:
@@ -13,39 +19,45 @@ class ExtractionConfig:
     min_detection_confidence: float = 0.6
     model_selection: int = 0
 
+
 class FaceExtractor:
     def __init__(self, config: ExtractionConfig = ExtractionConfig()):
         self.config = config
         self.mp_face = mp.solutions.face_detection
         self.face_detector = self.mp_face.FaceDetection(
             model_selection=config.model_selection,
-            min_detection_confidence=config.min_detection_confidence
+            min_detection_confidence=config.min_detection_confidence,
         )
-        logger.info(f"Initialized FaceExtractor with config: {config}")
-    
-    def extract(self, video_path: str, label: str, fps_sample: int = 1) -> Tuple[int, int]:
+        logger.debug(f"Initialized FaceExtractor with config: {config}")
+
+    def extract(
+        self, video_path: str, label: str, fps_sample: int = 1
+    ) -> Tuple[int, int]:
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
-        
+
         out_dir = os.path.join("data", "processed", label)
         os.makedirs(out_dir, exist_ok=True)
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Could not open video: {video_path}")
-        
+
         vid_fps = cap.get(cv2.CAP_PROP_FPS)
         if not vid_fps or vid_fps <= 0:
             vid_fps = 20
-            logger.warning(f"Could not detect FPS for {video_path}, using default {vid_fps}")
-        
+            logger.warning(
+                f"Could not detect FPS for {video_path}, using default {vid_fps}"
+            )
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         interval = max(1, int(vid_fps / fps_sample))
         expected_extractions = total_frames // interval
-        
-        logger.info(f"Processing {video_path}: {total_frames} frames at {vid_fps:.1f} FPS, "
-                   f"extracting every {interval} frames (~{expected_extractions} faces)")
-        
+
+        logger.info(
+            f"Processing {Path(video_path).name}: {total_frames} frames at {vid_fps:.1f} FPS"
+        )
+
         saved, skipped, frame_idx = 0, 0, 0
         base = os.path.splitext(os.path.basename(video_path))[0]
 
@@ -54,12 +66,11 @@ class FaceExtractor:
             if not ret:
                 break
             frame_idx += 1
-            
-            # Progress tracking
+
             if frame_idx % 100 == 0:
                 progress = (frame_idx / total_frames) * 100
-                logger.debug(f"Progress: {progress:.1f}% ({frame_idx}/{total_frames})")
-            
+                logger.debug(f"Progress: {progress:.1f}%")
+
             if frame_idx % interval != 0:
                 continue
 
@@ -74,10 +85,11 @@ class FaceExtractor:
             saved += 1
 
         cap.release()
-        logger.info(f"Completed {os.path.basename(video_path)}: "
-                   f"saved={saved}/{expected_extractions}, skipped={skipped}")
+        logger.info(
+            f"Completed {Path(video_path).name}: saved={saved}/{expected_extractions}, skipped={skipped}"
+        )
         return saved, skipped
-    
+
     def _extract_face_from_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = self.face_detector.process(rgb)
@@ -85,11 +97,10 @@ class FaceExtractor:
         if not result.detections:
             return None
 
-        # Take the most confident detection
         det = result.detections[0]
         if det.score[0] < self.config.min_detection_confidence:
             return None
-            
+
         bb = det.location_data.relative_bounding_box
         H, W = frame.shape[:2]
 
@@ -102,32 +113,138 @@ class FaceExtractor:
         face = frame[y1:y2, x1:x2]
         return face if face.size > 0 else None
 
+
+def process_single_video(args_tuple):
+    """Wrapper function for parallel processing"""
+    video_path, label, fps, config = args_tuple
+    try:
+        extractor = FaceExtractor(config)
+        return extractor.extract(video_path, label, fps)
+    except Exception as e:
+        logger.error(f"Failed to process {video_path}: {e}")
+        return 0, 0
+
+
+def batch_process(
+    video_dir: str,
+    label: str,
+    fps: int = 1,
+    config: ExtractionConfig = ExtractionConfig(),
+    num_workers: int = 4,
+) -> dict:
+    """Process multiple videos in a directory"""
+    video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    video_files = [
+        str(p)
+        for p in Path(video_dir).iterdir()
+        if p.suffix.lower() in video_extensions
+    ]
+
+    if not video_files:
+        logger.warning(f"No video files found in {video_dir}")
+        return {}
+
+    logger.info(
+        f"Found {len(video_files)} videos, processing with {num_workers} workers"
+    )
+
+    tasks = [(vf, label, fps, config) for vf in video_files]
+    results = {}
+
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_video = {
+                executor.submit(process_single_video, task): task[0] for task in tasks
+            }
+
+            for future in as_completed(future_to_video):
+                video = future_to_video[future]
+                try:
+                    saved, skipped = future.result()
+                    results[video] = {"saved": saved, "skipped": skipped}
+                except Exception as e:
+                    logger.error(f"Error processing {video}: {e}")
+                    results[video] = {"saved": 0, "skipped": 0, "error": str(e)}
+    else:
+        for task in tasks:
+            video = task[0]
+            try:
+                saved, skipped = process_single_video(task)
+                results[video] = {"saved": saved, "skipped": skipped}
+            except Exception as e:
+                logger.error(f"Error processing {video}: {e}")
+                results[video] = {"saved": 0, "skipped": 0, "error": str(e)}
+
+    total_saved = sum(r["saved"] for r in results.values())
+    total_skipped = sum(r["skipped"] for r in results.values())
+    logger.info(
+        f"Batch complete: {total_saved} faces saved, {total_skipped} frames skipped"
+    )
+
+    return results
+
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Extract face crops from video for focus detection")
-    ap.add_argument("--video", required=True, help="Path to input video file")
-    ap.add_argument("--label", required=True, choices=["focused", "not_focused"], 
-                    help="Classification label for the video")
-    ap.add_argument("--fps", type=int, default=1, 
-                    help="Target frames per second to extract (default: 1)")
-    ap.add_argument("--face-size", type=int, default=96,
-                    help="Output face crop size in pixels (default: 96)")
-    ap.add_argument("--padding", type=float, default=0.20,
-                    help="Padding ratio around detected face (default: 0.20)")
+    ap = argparse.ArgumentParser(
+        description="Extract face crops from video for focus detection"
+    )
+    ap.add_argument("--video", help="Path to single input video file")
+    ap.add_argument("--video-dir", help="Path to directory containing multiple videos")
+    ap.add_argument(
+        "--label",
+        required=True,
+        choices=["focused", "not_focused"],
+        help="Classification label for the video(s)",
+    )
+    ap.add_argument(
+        "--fps",
+        type=int,
+        default=1,
+        help="Target frames per second to extract (default: 1)",
+    )
+    ap.add_argument(
+        "--face-size",
+        type=int,
+        default=96,
+        help="Output face crop size in pixels (default: 96)",
+    )
+    ap.add_argument(
+        "--padding",
+        type=float,
+        default=0.20,
+        help="Padding ratio around detected face (default: 0.20)",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for batch processing (default: 4)",
+    )
     ap.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = ap.parse_args()
-    
+
     if args.debug:
         logger.setLevel(logging.DEBUG)
-    
+
+    if not args.video and not args.video_dir:
+        logger.error("Either --video or --video-dir must be specified")
+        sys.exit(1)
+
     try:
-        import numpy as np
-        config = ExtractionConfig(
-            face_size=args.face_size,
-            padding_ratio=args.padding
-        )
-        extractor = FaceExtractor(config)
-        saved, skipped = extractor.extract(args.video, args.label, args.fps)
-        logger.info(f"Extraction complete: {saved} faces saved, {skipped} frames skipped")
+        config = ExtractionConfig(face_size=args.face_size, padding_ratio=args.padding)
+
+        if args.video:
+            extractor = FaceExtractor(config)
+            saved, skipped = extractor.extract(args.video, args.label, args.fps)
+            logger.info(
+                f"Extraction complete: {saved} faces saved, {skipped} frames skipped"
+            )
+        else:
+            results = batch_process(
+                args.video_dir, args.label, args.fps, config, args.workers
+            )
+            logger.info(f"Processed {len(results)} videos")
+
     except Exception as e:
         logger.error(f"Extraction failed: {e}", exc_info=args.debug)
         sys.exit(1)
