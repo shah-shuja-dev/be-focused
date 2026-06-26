@@ -1,250 +1,330 @@
 import cv2, os, argparse, sys, logging
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import mediapipe as mp
 import numpy as np
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Try importing MediaPipe with fallback for different versions
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+    
+    # Check if we're using the new API (0.10.x+) or old API (< 0.10)
+    try:
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+        MEDIAPIPE_NEW_API = True
+        logger.info("Using MediaPipe new API (0.10.x+)")
+    except (ImportError, AttributeError):
+        try:
+            # Old API fallback
+            mp_face = mp.solutions.face_detection
+            MEDIAPIPE_NEW_API = False
+            logger.info("Using MediaPipe legacy API (< 0.10)")
+        except AttributeError:
+            MEDIAPIPE_AVAILABLE = False
+            logger.warning("MediaPipe found but no compatible face detection API")
+            
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    MEDIAPIPE_NEW_API = False
+    logger.warning("MediaPipe not installed. Using OpenCV fallback detector.")
 
-@dataclass
-class ExtractionConfig:
-    face_size: int = 96
-    padding_ratio: float = 0.20
-    min_detection_confidence: float = 0.6
-    model_selection: int = 0
-
+class FaceDetector:
+    """Unified face detector supporting multiple backends"""
+    
+    def __init__(self, min_confidence: float = 0.6):
+        self.min_confidence = min_confidence
+        self.backend = None
+        self.detector = None
+        
+        if MEDIAPIPE_AVAILABLE:
+            if MEDIAPIPE_NEW_API:
+                self._init_mediapipe_new(min_confidence)
+            else:
+                self._init_mediapipe_legacy(min_confidence)
+        else:
+            self._init_opencv_fallback()
+    
+    def _init_mediapipe_new(self, min_confidence: float):
+        """Initialize MediaPipe 0.10.x+ detector"""
+        try:
+            base_options = mp_python.BaseOptions(model_asset_path=None)
+            options = vision.FaceDetectorOptions(
+                base_options=base_options,
+                min_detection_confidence=min_confidence
+            )
+            self.detector = vision.FaceDetector.create_from_options(options)
+            self.backend = "mediapipe_new"
+            logger.info("Initialized MediaPipe face detector (new API)")
+        except Exception as e:
+            logger.warning(f"Failed to init MediaPipe new API: {e}. Falling back to OpenCV.")
+            self._init_opencv_fallback()
+    
+    def _init_mediapipe_legacy(self, min_confidence: float):
+        """Initialize MediaPipe < 0.10 detector"""
+        try:
+            self.detector = mp.solutions.face_detection.FaceDetection(
+                model_selection=0,
+                min_detection_confidence=min_confidence
+            )
+            self.backend = "mediapipe_legacy"
+            logger.info("Initialized MediaPipe face detector (legacy API)")
+        except Exception as e:
+            logger.warning(f"Failed to init MediaPipe legacy API: {e}. Falling back to OpenCV.")
+            self._init_opencv_fallback()
+    
+    def _init_opencv_fallback(self):
+        """Initialize OpenCV Haar Cascade as fallback"""
+        try:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if not os.path.exists(cascade_path):
+                # Try alternative path
+                cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_alt.xml'
+            
+            self.detector = cv2.CascadeClassifier(cascade_path)
+            if self.detector.empty():
+                raise ValueError("Failed to load cascade classifier")
+            
+            self.backend = "opencv"
+            logger.info("Initialized OpenCV Haar Cascade face detector (fallback)")
+        except Exception as e:
+            logger.error(f"Failed to initialize any face detector: {e}")
+            raise RuntimeError("No face detection backend available. Install MediaPipe or ensure OpenCV is properly installed.")
+    
+    def detect(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Detect face in frame and return bounding box (x, y, width, height)
+        Returns None if no face detected
+        """
+        if self.backend == "mediapipe_new":
+            return self._detect_mediapipe_new(frame)
+        elif self.backend == "mediapipe_legacy":
+            return self._detect_mediapipe_legacy(frame)
+        elif self.backend == "opencv":
+            return self._detect_opencv(frame)
+        else:
+            return None
+    
+    def _detect_mediapipe_new(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Detect using MediaPipe new API"""
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.detector.detect(mp_image)
+            
+            if result.detections:
+                # Get highest confidence detection
+                best_det = max(result.detections, key=lambda d: d.score[0] if hasattr(d, 'score') else 1.0)
+                bbox = best_det.bounding_box
+                return (bbox.origin_x, bbox.origin_y, bbox.width, bbox.height)
+        except Exception as e:
+            logger.debug(f"MediaPipe new API detection failed: {e}")
+        return None
+    
+    def _detect_mediapipe_legacy(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Detect using MediaPipe legacy API"""
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = self.detector.process(rgb)
+            
+            if result.detections:
+                # Get highest confidence detection
+                best_det = max(result.detections, key=lambda d: d.score[0])
+                bb = best_det.location_data.relative_bounding_box
+                H, W = frame.shape[:2]
+                
+                x = int(bb.xmin * W)
+                y = int(bb.ymin * H)
+                w = int(bb.width * W)
+                h = int(bb.height * H)
+                return (x, y, w, h)
+        except Exception as e:
+            logger.debug(f"MediaPipe legacy API detection failed: {e}")
+        return None
+    
+    def _detect_opencv(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Detect using OpenCV Haar Cascade"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.detector.detectMultiScale(
+                gray, 
+                scaleFactor=1.1, 
+                minNeighbors=5, 
+                minSize=(30, 30)
+            )
+            
+            if len(faces) > 0:
+                # Return the largest face (closest to camera)
+                largest = max(faces, key=lambda f: f[2] * f[3])
+                return tuple(largest)
+        except Exception as e:
+            logger.debug(f"OpenCV detection failed: {e}")
+        return None
 
 class FaceExtractor:
-    def __init__(self, config: ExtractionConfig = ExtractionConfig()):
-        self.config = config
-        self.mp_face = mp.solutions.face_detection
-        self.face_detector = self.mp_face.FaceDetection(
-            model_selection=config.model_selection,
-            min_detection_confidence=config.min_detection_confidence,
-        )
-        logger.debug(f"Initialized FaceExtractor with config: {config}")
-
-    def extract(
-        self, video_path: str, label: str, fps_sample: int = 1
-    ) -> Tuple[int, int]:
+    """Extract face crops from videos with configurable parameters"""
+    
+    def __init__(self, face_size: int = 96, padding_ratio: float = 0.20, 
+                 min_confidence: float = 0.6):
+        self.face_size = face_size
+        self.padding_ratio = padding_ratio
+        self.detector = FaceDetector(min_confidence=min_confidence)
+    
+    def extract(self, video_path: str, label: str, fps_sample: int = 1) -> Tuple[int, int]:
+        """
+        Extract face crops from video
+        
+        Args:
+            video_path: Path to input video
+            label: Classification label ('focused' or 'not_focused')
+            fps_sample: Target frames per second to extract
+        
+        Returns:
+            Tuple of (saved_count, skipped_count)
+        """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
-
+        
         out_dir = os.path.join("data", "processed", label)
         os.makedirs(out_dir, exist_ok=True)
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Could not open video: {video_path}")
-
+        
+        # Get video properties
         vid_fps = cap.get(cv2.CAP_PROP_FPS)
         if not vid_fps or vid_fps <= 0:
             vid_fps = 20
-            logger.warning(
-                f"Could not detect FPS for {video_path}, using default {vid_fps}"
-            )
-
+            logger.warning(f"Could not detect FPS, using default {vid_fps}")
+        
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         interval = max(1, int(vid_fps / fps_sample))
-        expected_extractions = total_frames // interval
-
-        logger.info(
-            f"Processing {Path(video_path).name}: {total_frames} frames at {vid_fps:.1f} FPS"
-        )
-
+        
+        video_name = Path(video_path).stem
+        logger.info(f"Processing '{video_name}': {total_frames} frames @ {vid_fps:.1f}fps")
+        
         saved, skipped, frame_idx = 0, 0, 0
-        base = os.path.splitext(os.path.basename(video_path))[0]
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+                
             frame_idx += 1
-
-            if frame_idx % 100 == 0:
+            
+            # Skip frames based on sampling interval
+            if frame_idx % interval != 0:
+                continue
+            
+            # Extract face
+            face_crop = self._extract_face(frame)
+            if face_crop is None:
+                skipped += 1
+                continue
+            
+            # Resize and save
+            face_crop = cv2.resize(face_crop, (self.face_size, self.face_size))
+            filename = f"{label}_{video_name}_{frame_idx:05d}.jpg"
+            filepath = os.path.join(out_dir, filename)
+            cv2.imwrite(filepath, face_crop)
+            saved += 1
+            
+            # Progress update
+            if saved % 100 == 0:
                 progress = (frame_idx / total_frames) * 100
                 logger.debug(f"Progress: {progress:.1f}%")
 
-            if frame_idx % interval != 0:
-                continue
-
-            face = self._extract_face_from_frame(frame)
-            if face is None:
-                skipped += 1
-                continue
-
-            face = cv2.resize(face, (self.config.face_size, self.config.face_size))
-            fname = os.path.join(out_dir, f"{label}_{base}_{frame_idx:05d}.jpg")
-            cv2.imwrite(fname, face)
-            saved += 1
-
         cap.release()
-        logger.info(
-            f"Completed {Path(video_path).name}: saved={saved}/{expected_extractions}, skipped={skipped}"
-        )
+        logger.info(f"Finished '{video_name}': {saved} saved, {skipped} skipped")
         return saved, skipped
-
-    def _extract_face_from_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self.face_detector.process(rgb)
-
-        if not result.detections:
+    
+    def _extract_face(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Extract face region from frame with padding"""
+        bbox = self.detector.detect(frame)
+        if bbox is None:
             return None
-
-        det = result.detections[0]
-        if det.score[0] < self.config.min_detection_confidence:
-            return None
-
-        bb = det.location_data.relative_bounding_box
+        
+        x, y, w, h = bbox
         H, W = frame.shape[:2]
-
-        pad = self.config.padding_ratio
-        x1 = max(0, int((bb.xmin - pad * bb.width) * W))
-        y1 = max(0, int((bb.ymin - pad * bb.height) * H))
-        x2 = min(W, int((bb.xmin + (1 + pad) * bb.width) * W))
-        y2 = min(H, int((bb.ymin + (1 + pad) * bb.height) * H))
-
+        pad = self.padding_ratio
+        
+        # Calculate padded coordinates
+        x1 = max(0, int(x - pad * w))
+        y1 = max(0, int(y - pad * h))
+        x2 = min(W, int(x + (1 + pad) * w))
+        y2 = min(H, int(y + (1 + pad) * h))
+        
         face = frame[y1:y2, x1:x2]
         return face if face.size > 0 else None
 
-
-def process_single_video(args_tuple):
-    """Wrapper function for parallel processing"""
-    video_path, label, fps, config = args_tuple
-    try:
-        extractor = FaceExtractor(config)
-        return extractor.extract(video_path, label, fps)
-    except Exception as e:
-        logger.error(f"Failed to process {video_path}: {e}")
-        return 0, 0
-
-
-def batch_process(
-    video_dir: str,
-    label: str,
-    fps: int = 1,
-    config: ExtractionConfig = ExtractionConfig(),
-    num_workers: int = 4,
-) -> dict:
-    """Process multiple videos in a directory"""
-    video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-    video_files = [
-        str(p)
-        for p in Path(video_dir).iterdir()
-        if p.suffix.lower() in video_extensions
-    ]
-
-    if not video_files:
-        logger.warning(f"No video files found in {video_dir}")
-        return {}
-
-    logger.info(
-        f"Found {len(video_files)} videos, processing with {num_workers} workers"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract face crops from videos for focus detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Process single video
+  python extract_faces.py --video focused_clip.avi --label focused
+  
+  # Process with custom settings
+  python extract_faces.py --video clip.avi --label focused --fps 2 --face-size 128
+  
+  # Batch processing (PowerShell)
+  Get-ChildItem data\\raw\\focused_*.avi | ForEach-Object {
+      python scripts\\extract_faces.py --video $_.FullName --label focused
+  }
+        """
     )
-
-    tasks = [(vf, label, fps, config) for vf in video_files]
-    results = {}
-
-    if num_workers > 1:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            future_to_video = {
-                executor.submit(process_single_video, task): task[0] for task in tasks
-            }
-
-            for future in as_completed(future_to_video):
-                video = future_to_video[future]
-                try:
-                    saved, skipped = future.result()
-                    results[video] = {"saved": saved, "skipped": skipped}
-                except Exception as e:
-                    logger.error(f"Error processing {video}: {e}")
-                    results[video] = {"saved": 0, "skipped": 0, "error": str(e)}
-    else:
-        for task in tasks:
-            video = task[0]
-            try:
-                saved, skipped = process_single_video(task)
-                results[video] = {"saved": saved, "skipped": skipped}
-            except Exception as e:
-                logger.error(f"Error processing {video}: {e}")
-                results[video] = {"saved": 0, "skipped": 0, "error": str(e)}
-
-    total_saved = sum(r["saved"] for r in results.values())
-    total_skipped = sum(r["skipped"] for r in results.values())
-    logger.info(
-        f"Batch complete: {total_saved} faces saved, {total_skipped} frames skipped"
-    )
-
-    return results
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(
-        description="Extract face crops from video for focus detection"
-    )
-    ap.add_argument("--video", help="Path to single input video file")
-    ap.add_argument("--video-dir", help="Path to directory containing multiple videos")
-    ap.add_argument(
-        "--label",
-        required=True,
-        choices=["focused", "not_focused"],
-        help="Classification label for the video(s)",
-    )
-    ap.add_argument(
-        "--fps",
-        type=int,
-        default=1,
-        help="Target frames per second to extract (default: 1)",
-    )
-    ap.add_argument(
-        "--face-size",
-        type=int,
-        default=96,
-        help="Output face crop size in pixels (default: 96)",
-    )
-    ap.add_argument(
-        "--padding",
-        type=float,
-        default=0.20,
-        help="Padding ratio around detected face (default: 0.20)",
-    )
-    ap.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help="Number of parallel workers for batch processing (default: 4)",
-    )
-    ap.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = ap.parse_args()
-
+    
+    parser.add_argument("--video", required=True, 
+                       help="Path to input video file")
+    parser.add_argument("--label", required=True, 
+                       choices=["focused", "not_focused"],
+                       help="Classification label")
+    parser.add_argument("--fps", type=int, default=1,
+                       help="Target FPS for extraction (default: 1)")
+    parser.add_argument("--face-size", type=int, default=96,
+                       help="Output face crop size in pixels (default: 96)")
+    parser.add_argument("--padding", type=float, default=0.20,
+                       help="Padding ratio around face (default: 0.20)")
+    parser.add_argument("--confidence", type=float, default=0.6,
+                       help="Minimum detection confidence (default: 0.6)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging")
+    
+    args = parser.parse_args()
+    
     if args.debug:
         logger.setLevel(logging.DEBUG)
-
-    if not args.video and not args.video_dir:
-        logger.error("Either --video or --video-dir must be specified")
-        sys.exit(1)
-
+    
     try:
-        config = ExtractionConfig(face_size=args.face_size, padding_ratio=args.padding)
-
-        if args.video:
-            extractor = FaceExtractor(config)
-            saved, skipped = extractor.extract(args.video, args.label, args.fps)
-            logger.info(
-                f"Extraction complete: {saved} faces saved, {skipped} frames skipped"
-            )
-        else:
-            results = batch_process(
-                args.video_dir, args.label, args.fps, config, args.workers
-            )
-            logger.info(f"Processed {len(results)} videos")
-
+        extractor = FaceExtractor(
+            face_size=args.face_size,
+            padding_ratio=args.padding,
+            min_confidence=args.confidence
+        )
+        
+        saved, skipped = extractor.extract(args.video, args.label, args.fps)
+        
+        if saved == 0:
+            logger.warning("No faces were extracted! Check if:")
+            logger.warning("  1. Video contains visible faces")
+            logger.warning("  2. Lighting conditions are adequate")
+            logger.warning("  3. Try lowering confidence threshold (--confidence 0.3)")
+            sys.exit(1)
+        
+        logger.info(f"✓ Successfully extracted {saved} faces")
+        
+    except KeyboardInterrupt:
+        logger.info("\nExtraction interrupted by user")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Extraction failed: {e}", exc_info=args.debug)
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
