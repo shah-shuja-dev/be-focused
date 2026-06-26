@@ -1,6 +1,10 @@
-import cv2, os, argparse, sys
+import cv2, os, argparse, sys, logging
 from dataclasses import dataclass
+from typing import Optional, Tuple
 import mediapipe as mp
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ExtractionConfig:
@@ -17,8 +21,9 @@ class FaceExtractor:
             model_selection=config.model_selection,
             min_detection_confidence=config.min_detection_confidence
         )
+        logger.info(f"Initialized FaceExtractor with config: {config}")
     
-    def extract(self, video_path: str, label: str, fps_sample: int = 1):
+    def extract(self, video_path: str, label: str, fps_sample: int = 1) -> Tuple[int, int]:
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
@@ -32,10 +37,15 @@ class FaceExtractor:
         vid_fps = cap.get(cv2.CAP_PROP_FPS)
         if not vid_fps or vid_fps <= 0:
             vid_fps = 20
-            print(f"  Warning: Could not detect FPS, using default {vid_fps}")
+            logger.warning(f"Could not detect FPS for {video_path}, using default {vid_fps}")
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         interval = max(1, int(vid_fps / fps_sample))
+        expected_extractions = total_frames // interval
+        
+        logger.info(f"Processing {video_path}: {total_frames} frames at {vid_fps:.1f} FPS, "
+                   f"extracting every {interval} frames (~{expected_extractions} faces)")
+        
         saved, skipped, frame_idx = 0, 0, 0
         base = os.path.splitext(os.path.basename(video_path))[0]
 
@@ -44,6 +54,12 @@ class FaceExtractor:
             if not ret:
                 break
             frame_idx += 1
+            
+            # Progress tracking
+            if frame_idx % 100 == 0:
+                progress = (frame_idx / total_frames) * 100
+                logger.debug(f"Progress: {progress:.1f}% ({frame_idx}/{total_frames})")
+            
             if frame_idx % interval != 0:
                 continue
 
@@ -58,17 +74,22 @@ class FaceExtractor:
             saved += 1
 
         cap.release()
-        print(f"  {os.path.basename(video_path)}: saved={saved}  skipped(no face)={skipped}")
+        logger.info(f"Completed {os.path.basename(video_path)}: "
+                   f"saved={saved}/{expected_extractions}, skipped={skipped}")
         return saved, skipped
     
-    def _extract_face_from_frame(self, frame):
+    def _extract_face_from_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = self.face_detector.process(rgb)
 
         if not result.detections:
             return None
 
+        # Take the most confident detection
         det = result.detections[0]
+        if det.score[0] < self.config.min_detection_confidence:
+            return None
+            
         bb = det.location_data.relative_bounding_box
         H, W = frame.shape[:2]
 
@@ -92,15 +113,21 @@ if __name__ == "__main__":
                     help="Output face crop size in pixels (default: 96)")
     ap.add_argument("--padding", type=float, default=0.20,
                     help="Padding ratio around detected face (default: 0.20)")
+    ap.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = ap.parse_args()
     
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    
     try:
+        import numpy as np
         config = ExtractionConfig(
             face_size=args.face_size,
             padding_ratio=args.padding
         )
         extractor = FaceExtractor(config)
-        extractor.extract(args.video, args.label, args.fps)
+        saved, skipped = extractor.extract(args.video, args.label, args.fps)
+        logger.info(f"Extraction complete: {saved} faces saved, {skipped} frames skipped")
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        logger.error(f"Extraction failed: {e}", exc_info=args.debug)
         sys.exit(1)
