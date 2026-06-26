@@ -1,0 +1,9 @@
+#My custom gitignore u may setup urs urself pls thx use this as exampel
+
+##environment
+venv
+.env
+
+##training dataset
+data
+
