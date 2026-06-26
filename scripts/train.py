@@ -272,13 +272,21 @@ def train(args):
             f.write(classification_report(true_labels, preds, target_names=classes))
         mlflow.log_artifact(report_path, artifact_path="reports")
 
-        # log_model() saves weights + environment + MLmodel spec
-        # registered_model_name auto-creates a registry entry
+        # Load best model weights
         model.load_state_dict(torch.load(best_model_path))
+        model.eval()
+
+        # Get sample input for model signature
+        sample_batch, _ = next(iter(val_loader))
+        example_input = sample_batch[:1].to(device)
+
+        # Log model with pickle format (avoids torch.export issues)
         mlflow.pytorch.log_model(
             model,
             artifact_path="model",
             registered_model_name=args.register_as,
+            input_example=example_input.cpu().numpy(),
+            serialization_format="pickle",  # Use pickle to avoid pt2 export issues
         )
 
         mlflow.log_metrics({"best_val_acc": best_val_acc, "final_val_f1": val_f1})
