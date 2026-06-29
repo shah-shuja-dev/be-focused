@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FocusGuard</title>
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #0f1117;
+        color: #e2e8f0;
+        min-height: 100vh;
+        padding: 2rem;
+      }
+      .logo {
+        font-size: 1.8rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #6366f1, #ec4899);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.25rem;
+      }
+      .subtitle {
+        color: #94a3b8;
+        font-size: 0.85rem;
+        margin-bottom: 1.5rem;
+      }
+
+      .status-bar {
+        background: #1e2130;
+        border: 1px solid #2d3148;
+        border-radius: 12px;
+        padding: 0.9rem 1.25rem;
+        margin-bottom: 1.5rem;
+        display: flex;
+        gap: 2rem;
+        flex-wrap: wrap;
+        font-size: 0.85rem;
+        color: #94a3b8;
+      }
+      .status-bar strong {
+        color: #e2e8f0;
+      }
+      .dot-green {
+        color: #4ade80;
+      }
+      .dot-gray {
+        color: #4a5568;
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 1rem;
+        margin-bottom: 2rem;
+      }
+      .card {
+        background: #1e2130;
+        border: 1px solid #2d3148;
+        border-radius: 12px;
+        padding: 1.25rem;
+      }
+      .card-label {
+        font-size: 0.7rem;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .card-value {
+        font-size: 2rem;
+        font-weight: 700;
+        margin-top: 0.25rem;
+      }
+      .red {
+        color: #f87171;
+      }
+      .green {
+        color: #4ade80;
+      }
+      .blue {
+        color: #60a5fa;
+      }
+      .purple {
+        color: #a78bfa;
+      }
+
+      .section-title {
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        margin-bottom: 0.75rem;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #1e2130;
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      th {
+        background: #2d3148;
+        padding: 0.7rem 1rem;
+        text-align: left;
+        font-size: 0.72rem;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      td {
+        padding: 0.7rem 1rem;
+        border-bottom: 1px solid #2d3148;
+        font-size: 0.875rem;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      tr:hover td {
+        background: #252840;
+      }
+
+      .badge {
+        display: inline-block;
+        padding: 0.15rem 0.55rem;
+        border-radius: 5px;
+        font-size: 0.72rem;
+        font-weight: 600;
+      }
+      .badge-red {
+        background: #7f1d1d;
+        color: #fca5a5;
+      }
+      .badge-green {
+        background: #14532d;
+        color: #86efac;
+      }
+
+      .empty {
+        text-align: center;
+        padding: 3rem;
+        color: #4a5568;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="logo">FocusGuard</div>
+    <div class="subtitle">Session started: {{ started_at }}</div>
+
+    <div class="status-bar">
+      <span
+        >Hours:
+        <strong
+          >{{ scheduler_status.get('work_start','--') }} – {{
+          scheduler_status.get('work_end','--') }}</strong
+        ></span
+      >
+      <span
+        >Days:
+        <strong
+          >{{ ', '.join(scheduler_status.get('work_days',[])) }}</strong
+        ></span
+      >
+      <span
+        >Interval:
+        <strong
+          >{{ scheduler_status.get('check_interval','--') }}s</strong
+        ></span
+      >
+      <span
+        >Window:
+        <strong
+          >{{ scheduler_status.get('window_duration','--') }}s</strong
+        ></span
+      >
+      <span>
+        {% if scheduler_status.get('is_work_time') %}
+        <span class="dot-green">●</span> <strong>Active</strong>
+        {% else %}
+        <span class="dot-gray">●</span> <strong>Sleeping</strong>
+        {% endif %}
+      </span>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">Violations Today</div>
+        <div class="card-value red">{{ total_today }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Check Interval</div>
+        <div class="card-value blue">
+          {{ scheduler_status.get('check_interval','--') }}s
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Window Duration</div>
+        <div class="card-value purple">
+          {{ scheduler_status.get('window_duration','--') }}s
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Today</div>
+        <div
+          class="card-value green"
+          style="font-size: 1.1rem; margin-top: 0.6rem"
+        >
+          {{ started_at[:10] }}
+        </div>
+      </div>
+    </div>
+
+    <p class="section-title">Today's Violations</p>
+
+    {% if violations %}
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Time</th>
+          <th>Duration</th>
+          <th>Confidence</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in violations|reverse %}
+        <tr>
+          <td>{{ v.id }}</td>
+          <td>{{ v.datetime[11:19] if v.datetime else '--' }}</td>
+          <td>
+            {% if v.duration %}{{ "%.0f"|format(v.duration) }}s{% else
+            %}ongoing{% endif %}
+          </td>
+          <td>{{ "%.1f"|format(v.confidence * 100) }}%</td>
+          <td>
+            {% if v.end_ts %}
+            <span class="badge badge-green">Resolved</span>
+            {% else %}
+            <span class="badge badge-red">Ongoing</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No violations today. Keep it up.</div>
+    {% endif %}
+
+    <script>
+      setTimeout(() => location.reload(), 30000);
+    </script>
+  </body>
+</html>
